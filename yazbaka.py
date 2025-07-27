@@ -4,6 +4,8 @@ import argparse
 import re
 import subprocess
 import sys
+from selectors import SelectSelector
+
 
 class ZFSError(IOError):
     pass
@@ -13,7 +15,7 @@ class NoMatchingSnapshots(ZFSError):
 
 # Main class for the Yazbaka (Yet Another ZFS Backup Application)
 class Yazbaka:
-    VERSION = "0.1"  # Version of the Yazbaka application
+    VERSION = "0.0.1"  # Version of the Yazbaka application
 
     def __init__(self, args):
         """
@@ -78,9 +80,9 @@ class Yazbaka:
         Performs the transfer using ZFS send/recv (incremental or new backup).
         """
         if self.args.incremental or self.args.full_incremental:
-            self.incremental_backup()
+            return self.incremental_backup()
         else:
-            self.new_backup()
+            return self.new_backup()
 
     def new_backup(self):
         """
@@ -103,8 +105,6 @@ class Yazbaka:
         if res.returncode != 0:
             raise ZFSError(res.stderr.decode())
 
-
-
     def incremental_backup(self):
         """
         Performs an incremental backup.
@@ -120,7 +120,8 @@ class Yazbaka:
         src_start = self.args.source + "@" + pairs[-1]
         src_end = src[-1]
         if src_start == src_end:
-            raise NoMatchingSnapshots("There are no snapshots tha can be sent")
+           return False
+            # raise NoMatchingSnapshots("There are no snapshots tha can be sent")
 
         if self.args.full_incremental:
             iflag = " -I "
@@ -131,12 +132,14 @@ class Yazbaka:
         recv = "zfs recv " + self.args.recv + " " + self.args.destination
         cmd = send + " | " + recv
 
-            if self.args.verbose:
+        if self.args.verbose:
             print(cmd)
 
         res = subprocess.run(cmd, capture_output=True, shell=True)
         if res.returncode != 0:
             raise ZFSError(res.stderr.decode())
+
+        return True
 
 
     @staticmethod
@@ -181,22 +184,6 @@ class Yazbaka:
                 j += 1
 
         return pairs
-
-    @staticmethod
-    def _get_timestamp(string):
-        """
-        Extracts a timestamp string from a given string.
-
-        Args:
-            string (str): The string to extract the timestamp from.
-
-        Returns:
-            str or None: The extracted timestamp string if found, otherwise None.
-        """
-        match = re.search(r"[0-9][0-9\-_T]*$", string)
-        if match is None:
-            return None
-        return match.group(0)
 
     def conditional_snapshot(self):
         """
@@ -265,26 +252,44 @@ class Yazbaka:
     def cleanup(self):
         """
         Handles the cleanup of old snapshots.
-        (Currently a placeholder, actual implementation would involve deleting old snapshots).
+        (implementation incomplete).
         """
-        pass  # Placeholder for cleanup implementation
+        src = self.list_yaz_snapshots(self.args.source)
+        dest  = self.list_yaz_snapshots(self.args.destination)
+        pairs = Yazbaka.get_pairs(src,dest)  # Get matching snapshot pairs
+        if len(pairs) <= self.args.keep:
+            self._nqprint("Nothing to remove")
+            return False
+
+        last = pairs[-5]
+        # if self.args.verbose:
+        self._nqprint("Last snapshot to keep: " + last)
+
+        self._destroy_before(src, last)
+        if self.args.delete:
+            self._destroy_before(dest, last)
+
+        print("Feature incomplete not performing cleanup")
+        return True
 
     def do_all(self):
         """
         Executes the main backup workflow: snapshot, transfer, and cleanup.
         """
-        self.conditional_snapshot()
+        self._nqprint(f"------------------{self.args.source} to {self.args.destination}------------------")
+
+        if not self.conditional_snapshot():
+            self._nqprint("No snapshot needed")
 
         if self.args.snap_only:
             return
 
-        if not self.args.quiet:
-            print("Transferring...")
-        self.transfer()
+        self._nqprint("Transferring...")
+        if not self.transfer():
+            self._nqprint("No transfer needed")
 
         if not self.args.no_cleanup:
-            if not self.args.quiet:
-                print("Cleaning up")
+            self._nqprint("Cleaning up")
             self.cleanup()
 
     @staticmethod
@@ -492,16 +497,16 @@ class Yazbaka:
         parser.add_argument('-d', '--delete', help="Delete old snapshots on the destination following the same retention policy", action="store_const", const=True)
         parser.add_argument('-o', '--omit',  help="Skip the snapshot if the most recent snapshot is less than specified time ago",  type=ascii)
         # parser.add_argument('-p', '--progress', help="Show progress", action="store_const", const=True) # Commented out progress argument
-        parser.add_argument('-k', help="Set the number or duration of matched snapshots to keep on the source (default=5).", type=int, default=5)
+        parser.add_argument('-k', '--keep', help="Set the number of matched snapshots to keep on the source (default=5).", type=int, default=5) #eventually add duration to this
         parser.add_argument('-l', '--label', help="Label used for the snapshot. (default yazbak)", type=ascii, default="yazbak")
         parser.add_argument('-s', '--send', help=" [DLPRbcehnpsvw] flags to pass to zfs send (see man zfs-send for flag descriptions) ", type=ascii, default="")
         parser.add_argument('-r', '--recv', '--receive', help="[FhMnsuv] flags to pass to zfs recv (see man zfs-recv for flag descriptions)",  type=ascii, default="")
         parser.add_argument('--snap-only', help="Only take a snapshot, do NOT transfer. Destination should be ommited if this argument is used. (Useful if you want to stop a service before making the snapshot and restart it before send)", action="store_const", const=True)
         parser.add_argument('--transfer-only', help="Only send, do NOT take a snapshot", action="store_const", const=True)
         parser.add_argument('--no-omit-unchanged', help="Still create a snapshot even if no data has been written since the last one.", action="store_const", const=True) # Not implemented
-        #parser.add_argument('--no-omit-exists', help="Still attempt to transfer even if the latest snapshot exists on the destination pool. This will force an 'f' in send options!", action="store_const", const=True) # Not implemented, add the code to force the f
-        parser.add_argument('-q', '--quiet', help="", action="store_const", const=True)
-        parser.add_argument('-v', '--verbose', help="", action="store_const", const=True)
+        parser.add_argument('--dry-run-cleanup', help="", action="store_const", const=True)
+        parser.add_argument('-q', '--quiet', help="Supress all output except errors", action="store_const", const=True)
+        parser.add_argument('-v', '--verbose', help="Provide additional output", action="store_const", const=True)
 
         parser.add_argument('source', help="source dataset (e.g. mypool/dataset)", type=ascii)
         # Destination argument is conditional; not required if --snap-only is used
@@ -510,14 +515,66 @@ class Yazbaka:
         parser.add_argument('--version', action='version', version='%(prog)s: ' + Yazbaka.VERSION)
         return parser.parse_args()
 
+    def _nqprint(self, pstr):
+        if not self.args.quiet:
+            print(pstr)
+
+    def _vprint(self, pstr):
+        if self.args.verbose:
+            print(pstr)
+
+    def _destroy_before(self, src, last_keep):
+        last_time = Yazbaka._get_datetime(last_keep)
+        for snapshot in src:
+            cur_time = Yazbaka._get_datetime(snapshot)
+            if cur_time < last_time:
+                self._nqprint(f"Deleting: {snapshot}")
+                cmd = f"zfs destroy {snapshot}"
+                self._vprint(cmd)
+                if not self.args.dry_run_cleanup:
+                    res = subprocess.run(cmd, capture_output=True, shell=True)
+                    if res.returncode != 0:
+                        raise ZFSError(res.stderr.decode())
+
+    @staticmethod
+    def _get_timestamp(string):
+        """
+        Extracts a timestamp string from a given string.
+
+        Args:
+            string (str): The string to extract the timestamp from.
+
+        Returns:
+            str or None: The extracted timestamp string if found, otherwise None.
+        """
+        match = re.search(r"[0-9][0-9\-_T]*$", string)
+        if match is None:
+            return None
+
+        return match.group(0)
+
+    @staticmethod
+    def _get_datetime(snap_string):
+        """
+        Extracts a timestamp string from a given string.
+
+        Args:
+            snap_string (str): The string to extract the timestamp from.
+
+        Returns:
+            datetime or None: The extracted timestamp string if found, otherwise None.
+        """
+        match = re.search(r"[0-9][0-9\-_T]*$", snap_string)
+        if match is None:
+            return None
+        timestamp = match.group(0)
+        timestamp = timestamp[:-2] + ":" + timestamp[-2:]
+        # print(timestamp)
+        return datetime.fromisoformat(timestamp)
+
 
 if __name__ == "__main__":
-    # Parse command-line arguments
     args = Yazbaka.parse_args()
-    # Validate the parsed arguments
     Yazbaka.validate_args(args)
-    # print(args) # Debugging line to print parsed arguments
-    # Create an instance of the Yazbaka class
     backup = Yazbaka(args)
-    # Execute the main backup workflow
     backup.do_all()
